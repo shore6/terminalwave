@@ -1,6 +1,6 @@
 [package]
 name = "terminalwave"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Keyboard-driven, vim-like VCD waveform viewer for the terminal"
 license = "MIT"
