@@ -57,6 +57,8 @@ pub struct App {
     pub view_start: f64,
     /// Time units per terminal column.
     pub zoom: f64,
+    /// Half period of the fastest clock-like signal; zoom steps snap to it.
+    grid: Option<f64>,
     pub cursor: u64,
     pub markers: [Option<u64>; 26],
     pub last_marker: Option<usize>,
@@ -84,6 +86,28 @@ pub struct App {
 }
 
 const MIN_ZOOM: f64 = 1.0 / 16.0;
+/// Tolerance (in columns) so times exactly on a column boundary are not
+/// pushed into the previous column by floating-point error.
+const COL_EPS: f64 = 1e-9;
+
+/// Most common interval between changes of the busiest 1-bit signal, i.e.
+/// the half period of the fastest clock. `None` if nothing looks periodic.
+fn clock_step(vcd: &Vcd) -> Option<f64> {
+    let s = vcd
+        .signals
+        .iter()
+        .filter(|s| s.kind == SigKind::Bits && s.width == 1 && s.times.len() >= 3)
+        .max_by_key(|s| s.times.len())?;
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    for w in s.times.windows(2) {
+        *counts.entry(w[1] - w[0]).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|&(d, _)| d > 0)
+        .max_by_key(|&(d, n)| (n, std::cmp::Reverse(d)))
+        .map(|(d, _)| d as f64)
+}
 
 impl App {
     pub fn new(vcd: Vcd, path: PathBuf) -> App {
@@ -96,6 +120,7 @@ impl App {
             top: 0,
             view_start: 0.0,
             zoom: 1.0,
+            grid: None,
             cursor: 0,
             markers: [None; 26],
             last_marker: None,
@@ -122,6 +147,7 @@ impl App {
             layout: Layout::default(),
         };
         app.cursor = app.vcd.start_time;
+        app.grid = clock_step(&app.vcd);
         // Expand the top-level scopes so the tree is useful right away.
         let roots = app.vcd.scopes[0].children.clone();
         for r in roots {
@@ -261,7 +287,29 @@ impl App {
 
     /// Column of time `t` relative to the waveform area (may be off-screen).
     pub fn col_of(&self, t: u64) -> f64 {
-        ((t as f64 - self.view_start) / self.zoom).floor()
+        ((t as f64 - self.view_start) / self.zoom + COL_EPS).floor()
+    }
+
+    /// First integer time that belongs to column `x` (inverse of `col_of`).
+    pub fn col_time(&self, x: usize) -> u64 {
+        let t = self.view_start + (x as f64 - COL_EPS) * self.zoom;
+        if t <= 0.0 { 0 } else { t.ceil() as u64 }
+    }
+
+    /// Snap a zoom value so that the clock half period spans a whole number
+    /// of columns (or a column spans a whole number of half periods).
+    /// Otherwise equal pulses round to columns of unequal width.
+    fn snap_zoom(&self, z: f64) -> f64 {
+        let max = self.max_zoom();
+        let z = z.clamp(MIN_ZOOM, max);
+        let Some(g) = self.grid else { return z };
+        if z <= g {
+            let kmin = (g / max).ceil().max(1.0);
+            let kmax = (g / MIN_ZOOM).floor().max(kmin);
+            g / (g / z).round().clamp(kmin, kmax)
+        } else {
+            g * (z / g).round().clamp(1.0, (max / g).floor().max(1.0))
+        }
     }
 
     fn cursor_visible(&self) -> bool {
@@ -308,13 +356,17 @@ impl App {
     }
 
     fn zoom_by(&mut self, factor: f64) {
+        self.set_zoom(self.snap_zoom(self.zoom * factor));
+    }
+
+    fn set_zoom(&mut self, zoom: f64) {
         let w = self.wave_w();
         let (anchor_t, anchor_col) = if self.cursor_visible() {
             (self.cursor as f64, self.col_of(self.cursor))
         } else {
             (self.view_start + w / 2.0 * self.zoom, w / 2.0)
         };
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, self.max_zoom());
+        self.zoom = zoom;
         self.view_start = anchor_t - anchor_col * self.zoom;
         self.clamp_view();
     }
@@ -815,7 +867,7 @@ impl App {
         let (w, h) = (self.layout.width, self.layout.height);
         self.update_layout(w, h);
         let new_w = self.wave_w();
-        self.zoom = (self.zoom * old_w / new_w).clamp(MIN_ZOOM, self.max_zoom());
+        self.zoom = self.snap_zoom(self.zoom * old_w / new_w);
         self.clamp_view();
     }
 
@@ -1350,8 +1402,8 @@ impl App {
             "fit" | "f" => self.fit(),
             "zoom" | "z" => match format::parse_time(arg, self.vcd.timescale_fs) {
                 Some(t) if t > 0 => {
-                    let f = (t as f64).max(MIN_ZOOM) / self.zoom;
-                    self.zoom_by(f);
+                    // An explicit value is honoured as is (no snapping).
+                    self.set_zoom((t as f64).clamp(MIN_ZOOM, self.max_zoom()));
                 }
                 _ => self.error("usage: :zoom <time-per-column>  (e.g. :zoom 10ns)"),
             },
@@ -1613,6 +1665,7 @@ impl App {
             .map(|(s, &e)| (s.path.clone(), e))
             .collect();
         self.vcd = vcd;
+        self.grid = clock_step(&self.vcd);
         self.expanded = self
             .vcd
             .scopes
@@ -1642,5 +1695,78 @@ impl App {
 fn r_depth(r: &TreeNode) -> usize {
     match r {
         TreeNode::Scope(_, d) | TreeNode::Var(_, d) => *d,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clock_app(half: u64, edges: u64, wave_w: u16) -> App {
+        let mut src = String::from(
+            "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! clk $end\n\
+             $upscope $end\n$enddefinitions $end\n",
+        );
+        for i in 0..=edges {
+            src += &format!("#{}\n{}!\n", i * half, i % 2);
+        }
+        let mut app = App::new(
+            crate::vcd::parse(src.as_bytes()).unwrap(),
+            PathBuf::from("t.vcd"),
+        );
+        app.layout.wave_w = wave_w;
+        app.fit();
+        app
+    }
+
+    /// Widths (in columns) of the fully visible clock pulses.
+    fn pulse_widths(app: &App, half: u64, edges: u64) -> Vec<i64> {
+        let w = app.layout.wave_w as f64;
+        let cols: Vec<f64> = (0..=edges)
+            .map(|i| app.col_of(i * half))
+            .filter(|&c| c >= 0.0 && c < w)
+            .collect();
+        cols.windows(2).map(|p| (p[1] - p[0]) as i64).collect()
+    }
+
+    #[test]
+    fn clock_pulses_have_equal_width_after_zoom() {
+        // Issue #1: odd widths/periods used to give pulses of 2 and 3 columns.
+        for (half, edges, wave_w) in [(5, 60, 173), (10, 37, 131), (7, 200, 97), (500, 90, 211)] {
+            let mut app = clock_app(half, edges, wave_w);
+            assert_eq!(app.grid, Some(half as f64));
+            for step in 0..8 {
+                app.zoom_by(0.5);
+                app.scroll_cols(3.0);
+                if app.zoom > half as f64 {
+                    continue; // less than one column per pulse
+                }
+                let widths = pulse_widths(&app, half, edges);
+                assert!(
+                    widths.windows(2).all(|p| p[0] == p[1]),
+                    "half={half} w={wave_w} step={step} zoom={} widths={widths:?}",
+                    app.zoom
+                );
+                // The renderer must agree with col_of on where edges fall.
+                for i in 0..=edges {
+                    let c = app.col_of(i * half);
+                    if c >= 0.0 && c < wave_w as f64 {
+                        let x = c as usize;
+                        assert!(app.col_time(x) <= i * half && i * half < app.col_time(x + 1));
+                    }
+                }
+            }
+            // Zooming back out always makes progress up to the limit.
+            let mut prev = app.zoom;
+            for _ in 0..20 {
+                app.zoom_by(2.0);
+                if app.zoom == prev {
+                    break;
+                }
+                assert!(app.zoom > prev);
+                prev = app.zoom;
+            }
+            assert!(app.zoom * app.wave_w() >= app.span() as f64);
+        }
     }
 }

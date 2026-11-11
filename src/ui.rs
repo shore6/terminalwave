@@ -579,12 +579,7 @@ fn draw_waves(buf: &mut Buffer, app: &App) {
 fn draw_item_wave(buf: &mut Buffer, app: &App, item: &Item, x0: u16, y: u16, w: usize) {
     let s = app.sig(item);
     let times = &s.times;
-    let z = app.zoom;
-    let vs = app.view_start;
-    let col_t = |x: usize| -> u64 {
-        let t = vs + x as f64 * z;
-        if t <= 0.0 { 0 } else { t.ceil() as u64 }
-    };
+    let col_t = |x: usize| app.col_time(x);
     let mut p0 = times.partition_point(|&t| t < col_t(0));
     let scalar = app.is_scalar(item);
     let end_col = app.col_of(app.vcd.end_time);
