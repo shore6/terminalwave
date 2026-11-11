@@ -260,17 +260,31 @@ impl App {
     }
 
     fn max_zoom(&self) -> f64 {
-        (self.span().max(1) as f64 / self.wave_w() * 2.0).max(MIN_ZOOM)
+        (self.span().max(1) as f64 / self.wave_w() * 2.0).max(self.fit_zoom())
+    }
+
+    /// Smallest zoom that shows the whole time range and is on the clock
+    /// grid (see `snap_zoom`). Rounds up, so the right edge may stay empty.
+    fn fit_zoom(&self) -> f64 {
+        let span = self.span();
+        if span == 0 {
+            return 1.0;
+        }
+        let w = (self.wave_w() - 1.0).max(1.0);
+        let need = (span as f64 / w).max(MIN_ZOOM);
+        match self.grid {
+            Some(g) if need <= g => {
+                g / (g / need)
+                    .floor()
+                    .clamp(1.0, (g / MIN_ZOOM).floor().max(1.0))
+            }
+            Some(g) => g * (need / g).ceil(),
+            None => need,
+        }
     }
 
     pub fn fit(&mut self) {
-        let span = self.span();
-        let w = (self.wave_w() - 1.0).max(1.0);
-        self.zoom = if span == 0 {
-            1.0
-        } else {
-            (span as f64 / w).max(MIN_ZOOM)
-        };
+        self.zoom = self.fit_zoom();
         self.view_start = self.vcd.start_time as f64;
         self.clamp_view();
     }
@@ -1575,7 +1589,7 @@ impl App {
                         && let (Ok(a), Ok(b), Ok(c)) = (f[0].parse(), f[1].parse(), f[2].parse())
                     {
                         self.view_start = a;
-                        self.zoom = f64::max(b, MIN_ZOOM);
+                        self.zoom = self.snap_zoom(b);
                         self.cursor = c;
                     }
                 }
@@ -1732,9 +1746,25 @@ mod tests {
     #[test]
     fn clock_pulses_have_equal_width_after_zoom() {
         // Issue #1: odd widths/periods used to give pulses of 2 and 3 columns.
-        for (half, edges, wave_w) in [(5, 60, 173), (10, 37, 131), (7, 200, 97), (500, 90, 211)] {
+        for (half, edges, wave_w) in [
+            (5, 60, 173),
+            (10, 37, 131),
+            (7, 200, 97),
+            (500, 90, 211),
+            (5, 12, 80),
+        ] {
             let mut app = clock_app(half, edges, wave_w);
             assert_eq!(app.grid, Some(half as f64));
+            // :fit / initial view: everything visible and already uniform.
+            assert!(app.col_of(app.vcd.end_time) < wave_w as f64);
+            if app.zoom <= half as f64 {
+                let widths = pulse_widths(&app, half, edges);
+                assert!(
+                    widths.windows(2).all(|p| p[0] == p[1]),
+                    "fit: half={half} w={wave_w} zoom={} widths={widths:?}",
+                    app.zoom
+                );
+            }
             for step in 0..8 {
                 app.zoom_by(0.5);
                 app.scroll_cols(3.0);
