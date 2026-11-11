@@ -1,0 +1,17 @@
+[package]
+name = "terminalwave"
+version = "0.1.0"
+edition = "2024"
+description = "Keyboard-driven, vim-like VCD waveform viewer for the terminal"
+license = "MIT"
+readme = "README.md"
+keywords = ["vcd", "waveform", "tui", "verilog", "fpga"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+ratatui = "0.30"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
