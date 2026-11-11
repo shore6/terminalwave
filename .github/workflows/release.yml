@@ -3,6 +3,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create and release (e.g. v1.0.0)"
+        required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -31,10 +39,26 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name=terminalwave-${{ github.ref_name }}-${{ matrix.target }}
+          name=terminalwave-${TAG}-${{ matrix.target }}
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" README.md LICENSE "$name/"
           if [ "${{ runner.os }}" = "Windows" ]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: terminalwave-*.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: terminalwave ${{ env.TAG }}
+          generate_release_notes: true
           files: terminalwave-*.*
